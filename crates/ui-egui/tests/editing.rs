@@ -4043,3 +4043,49 @@ fn private_new_chinese_keyboard_input_preserves_font_layout_and_saved_pixels() {
     assert_eq!(std::fs::read(path).unwrap(), original);
     println!("verified Chinese keyboard insertion/deletion and save/reopen rendering on {pages} pages");
 }
+
+#[test]
+fn diagonal_text_opens_a_rotated_editor_and_applies() {
+    // A 25-degree label plus a horizontal one: the click must open the turned paragraph,
+    // and the draft must be painted turned instead of wrapping into a tall narrow box.
+    let bytes = source_font_fixture_with_text(
+        "BT /F1 18 Tf 20 250 Td (Flat heading) Tj ET BT /F1 12 Tf 0.9063 0.4226 -0.4226 0.9063 40 150 Tm (Rotated label) Tj ET",
+    );
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(move |_cc| {
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.open_bytes("rotated.pdf", None, bytes).unwrap();
+        app
+    });
+    h.run_steps(4);
+    assert!(h.state_mut().execute("edit.edit_text"));
+    h.run_steps(2);
+    let page = h.state().views[0].page_screen_rect(0).expect("on screen");
+    // Along the label's baseline: user (64, 160) is view (64, 140) on the 300pt page.
+    let at = egui::pos2(page.left() + 64.0 / 300.0 * page.width(), page.top() + 140.0 / 300.0 * page.height());
+    h.hover_at(at);
+    h.run_steps(1);
+    h.drag_at(at);
+    h.run_steps(1);
+    h.drop_at(at);
+    h.run_steps(4);
+    let ed = h.state().views[0].line_editor.clone().expect("the diagonal line opens for editing");
+    assert_eq!(ed.text, "Rotated label");
+    assert!(ed.rotated, "a 25-degree paragraph takes the rotated overlay");
+    assert!((ed.angle.to_degrees() + 25.0).abs() < 2.0, "the editor follows the baseline: {}", ed.angle.to_degrees());
+    assert!(ed.len_factor > 1.0 && ed.len_factor < 1.5, "advances run along the baseline: {}", ed.len_factor);
+    assert!(ed.size > 4.0 && ed.size < 200.0, "no scale blow-up at fit zoom: {}", ed.size);
+    assert!(
+        h.output().shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(t) if t.angle.abs() > 0.03)),
+        "the draft is painted turned"
+    );
+    // Typing through the rotated editor extends the draft...
+    h.event(egui::Event::Text("!".into()));
+    h.run_steps(3);
+    assert_eq!(h.state().views[0].line_editor.as_ref().unwrap().text, "Rotated label!");
+    // ...and Cmd+Enter applies it back to the (still diagonal) paragraph.
+    h.key_press_modifiers(Modifiers::COMMAND, Key::Enter);
+    h.run_steps(6);
+    assert!(h.state().views[0].line_editor.is_none(), "applied editors close");
+    assert!(page_texts(h.state())[0].contains("Rotated label!"), "applied text survives: {:?}", page_texts(h.state()));
+}

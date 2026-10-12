@@ -7,7 +7,55 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use egui::{Color32, CornerRadius, FontFamily, FontId, Pos2, Rect, Stroke};
+use egui::{Color32, CornerRadius, FontFamily, FontId, Pos2, Rect, Stroke, Vec2};
+
+/// A paragraph being edited is drawn turned to its baseline while this far from
+/// horizontal (about two degrees). Below it the classic horizontal overlay is exact.
+const ROTATED_TOLERANCE: f32 = 0.035;
+
+/// Screen-space reading angle of a paragraph: its user-space counterclockwise baseline
+/// angle, the document's clockwise `/Rotate` and the view's clockwise rotation, folded
+/// to (-PI, PI]. Screen coordinates point down, so the result is clockwise-positive and
+/// feeds `TextShape` rotation directly.
+fn screen_angle(user_ccw_deg: f64, page_cw: u16, view_cw: u16) -> f32 {
+    let raw = (-user_ccw_deg + f64::from(page_cw) + f64::from(view_cw)).to_radians() as f32;
+    if !raw.is_finite() {
+        return 0.0;
+    }
+    let mut folded = raw % std::f32::consts::TAU;
+    if folded <= -std::f32::consts::PI {
+        folded += std::f32::consts::TAU;
+    } else if folded > std::f32::consts::PI {
+        folded -= std::f32::consts::TAU;
+    }
+    folded
+}
+
+/// Baseline length of a user-space box along its baseline, relative to the box width
+/// (1.0 when horizontal). The overlay lays text out along the baseline, while the box
+/// only spans its projection: without this the advance calibration in [`editor_job`]
+/// would squeeze diagonal text by the cosine of its angle.
+fn baseline_factor(source_rect: [f32; 4], user_ccw_deg: f64) -> f32 {
+    let (w, h) = ((source_rect[2] - source_rect[0]).abs(), (source_rect[3] - source_rect[1]).abs());
+    if !w.is_finite() || !h.is_finite() || w <= 1e-6 || !user_ccw_deg.is_finite() {
+        return 1.0;
+    }
+    let t = user_ccw_deg.to_radians();
+    let len = (f64::from(w) * t.cos().abs() + f64::from(h) * t.sin().abs()) as f32;
+    if !len.is_finite() {
+        return 1.0;
+    }
+    (len / w).clamp(1.0, 8.0)
+}
+
+/// Screen pixels per view point: the page's drawn width over its displayed width.
+/// Unlike the per-paragraph box ratio this holds for every page and text rotation.
+fn page_scale(xf: &PageXform, info: &DocInfo, page: usize) -> Option<f32> {
+    let _ = info.pages.get(page)?;
+    let shown = (if xf.rot % 180 == 90 { xf.ph } else { xf.pw }).max(1.0);
+    let s = xf.rect.width() / shown;
+    (s.is_finite() && s > 0.0).then_some(s)
+}
 use pdfcraft_engine::{Edit, ObjectKind, ObjectTarget};
 use pdfcraft_render::DocInfo;
 
@@ -118,7 +166,20 @@ pub struct LineEditor {
     /// The initial source container width in screen pixels.
     max_width: f32,
     /// Current screen-space size. Recomputed from the current page transform before painting.
-    size: f32,
+    pub size: f32,
+    /// Screen-space reading angle (radians, clockwise-positive), folded to (-PI, PI].
+    /// Recomputed every frame so turning the view keeps the editor glued to its text.
+    pub angle: f32,
+    /// Beyond [`ROTATED_TOLERANCE`] from horizontal the paragraph uses the rotated overlay.
+    pub rotated: bool,
+    /// [`baseline_factor`] for the current source box: advance calibration along the baseline.
+    pub len_factor: f32,
+    /// Caret position for the rotated overlay, as a character (not byte) index into [`Self::text`].
+    cursor: usize,
+    /// Selection anchor for the rotated overlay, as a character index. `None` collapses it.
+    anchor: Option<usize>,
+    /// The rotated overlay held keyboard focus last frame (apply on focus loss inside the view).
+    was_focused: bool,
     focus: bool,
     /// The Format text panel's values, and what the paragraph had (to send only changes).
     pub look: pdfcraft_engine::AddedText,
@@ -242,6 +303,81 @@ impl LineEditor {
         self.text = block.editor_text.clone();
         self.original = self.text.clone();
     }
+
+    /// Character count of the draft (the rotated overlay addresses characters, not bytes).
+    fn char_count(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    /// Byte offset of a character index, saturating at the text end (always a boundary).
+    fn byte_at(text: &str, chars: usize) -> usize {
+        text.char_indices().nth(chars).map_or(text.len(), |(at, _)| at)
+    }
+
+    /// Keep the rotated caret and anchor inside the draft; collapse an empty selection.
+    fn clamp_cursor(&mut self) {
+        let len = self.char_count();
+        self.cursor = self.cursor.min(len);
+        if let Some(a) = self.anchor {
+            let a = a.min(len);
+            self.anchor = (a != self.cursor).then_some(a);
+        }
+    }
+
+    /// Mirror the rotated selection into [`Self::selection`] (byte range) for formatting.
+    fn sync_selection(&mut self) {
+        self.clamp_cursor();
+        self.selection = self.anchor.map(|a| {
+            let (lo, hi) = (a.min(self.cursor), a.max(self.cursor));
+            Self::byte_at(&self.text, lo)..Self::byte_at(&self.text, hi)
+        });
+    }
+
+    /// Replace the rotated selection (or insert at the caret), collapsing the selection.
+    fn replace_selection_with(&mut self, insert: &str) {
+        self.clamp_cursor();
+        let cur = self.cursor;
+        let (lo, hi) = match self.anchor {
+            Some(a) => (a.min(cur), a.max(cur)),
+            None => (cur, cur),
+        };
+        let (b0, b1) = (Self::byte_at(&self.text, lo), Self::byte_at(&self.text, hi));
+        self.text.replace_range(b0..b1, insert);
+        self.cursor = lo + insert.chars().count();
+        self.anchor = None;
+        self.selection = None;
+    }
+}
+
+/// Whether a character breaks words for word-wise caret motion (whitespace vs the rest).
+fn is_word_char(c: char) -> bool {
+    !c.is_whitespace()
+}
+
+/// Start of the word at or before `chars`: first its trailing blanks, then the word.
+fn word_start_before(text: &str, chars: usize) -> usize {
+    let v: Vec<char> = text.chars().collect();
+    let mut i = chars.min(v.len());
+    while i > 0 && !is_word_char(v[i - 1]) {
+        i -= 1;
+    }
+    while i > 0 && is_word_char(v[i - 1]) {
+        i -= 1;
+    }
+    i
+}
+
+/// End of the word at or after `chars`: first the word, then its trailing blanks.
+fn word_end_after(text: &str, chars: usize) -> usize {
+    let v: Vec<char> = text.chars().collect();
+    let mut i = chars.min(v.len());
+    while i < v.len() && is_word_char(v[i]) {
+        i += 1;
+    }
+    while i < v.len() && !is_word_char(v[i]) {
+        i += 1;
+    }
+    i
 }
 
 /// The look shown for a paragraph: the family and weight guessed from its PDF font name.
@@ -726,6 +862,12 @@ pub(crate) fn page_input(
         // page's right edge, a multi-line paragraph rewraps to its own width.
         let right = xf.rect.right().min(view.viewport_rect().right()) - 6.0;
         let max_width = if l.rows.len() == 1 { (right - boxes[hit].left()).max(boxes[hit].width()) } else { boxes[hit].width() };
+        // The editor follows the paragraph's baseline on screen: user-space angle, document
+        // /Rotate and view rotation folded together. Single visual rows past the tolerance
+        // use the rotated overlay; anything else keeps the classic horizontal one.
+        let page_rot = info.pages.get(page).map(|p| p.rotation).unwrap_or(0);
+        let angle = screen_angle(l.rotation, page_rot, xf.rot);
+        let chars = text.chars().count();
         view.line_editor = Some(LineEditor {
             selection: None,
             font_resource: None,
@@ -741,6 +883,12 @@ pub(crate) fn page_input(
             overflow: false,
             max_width,
             size: (l.size as f32 * scale).clamp(8.0, 72.0),
+            angle,
+            rotated: angle.abs() > ROTATED_TOLERANCE && l.rows.len() == 1,
+            len_factor: baseline_factor(l.rect.map(|v| v as f32), l.rotation),
+            cursor: chars,
+            anchor: None,
+            was_focused: false,
             focus: true,
             look: look_of(l),
             look0: look_of(l),
@@ -837,7 +985,9 @@ fn editor_job(ui: &egui::Ui, ed: &LineEditor, text: &str, scale: f32, width: f32
                 font.family = FontFamily::Name(name.clone().into());
             }
             let native_width = ui.fonts_mut(|f| f.layout_no_wrap(line.text.clone(), font.clone(), Color32::BLACK).size().x);
-            let target_width = ((line.rect[2] - line.rect[0]) * look.size / line.size.max(0.01)) as f32 * scale;
+            // The target is the run's extent along its baseline: for diagonal text the box
+            // width only spans its projection (see `baseline_factor`).
+            let target_width = ((line.rect[2] - line.rect[0]) * look.size / line.size.max(0.01)) as f32 * scale * ed.len_factor;
             let spacing = if original_face { (target_width - native_width) / line.text.chars().count().saturating_sub(1).max(1) as f32 } else { 0.0 };
             job.append(
                 text.get(range).unwrap_or_default(),
@@ -937,6 +1087,374 @@ fn editor_galley(ui: &egui::Ui, ed: &LineEditor, text: &str, scale: f32, width: 
     galley
 }
 
+/// Focus id of the rotated inline editor (one paragraph edits at a time).
+fn rotated_id() -> egui::Id {
+    egui::Id::new("edit-text-rotated-input")
+}
+
+/// Fill a convex screen-space quadrilateral with a flat color.
+fn paint_quad(painter: &egui::Painter, quad: [Pos2; 4], color: Color32) {
+    let mut mesh = egui::Mesh::default();
+    mesh.vertices.extend(quad.iter().map(|p| egui::epaint::Vertex { pos: *p, uv: Pos2::ZERO, color }));
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(mesh);
+}
+
+/// Whether `p` falls inside the convex quadrilateral `q` (either winding).
+fn quad_contains(q: [Pos2; 4], p: Pos2) -> bool {
+    let edge = |a: Pos2, b: Pos2| (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+    let signs = [edge(q[0], q[1]), edge(q[1], q[2]), edge(q[2], q[3]), edge(q[3], q[0])];
+    signs.iter().all(|v| *v >= 0.0) || signs.iter().all(|v| *v <= 0.0)
+}
+
+/// Move the rotated caret for an arrow/home/end key; word-wise with `word`.
+fn rotated_move(galley: &egui::Galley, cursor: usize, key: egui::Key, word: bool, text: &str) -> usize {
+    use egui::text::{CCursor, CharIndex};
+    let cc = CCursor { index: CharIndex(cursor), prefer_next_row: false };
+    let clamped = galley.clamp_cursor(&cc);
+    let next = match key {
+        egui::Key::ArrowLeft => {
+            if word {
+                CCursor::new(word_start_before(text, clamped.index.0))
+            } else {
+                galley.cursor_left_one_character(&clamped)
+            }
+        }
+        egui::Key::ArrowRight => {
+            if word {
+                CCursor::new(word_end_after(text, clamped.index.0))
+            } else {
+                galley.cursor_right_one_character(&clamped)
+            }
+        }
+        egui::Key::ArrowUp => galley.cursor_up_one_row(&clamped, None).0,
+        egui::Key::ArrowDown => galley.cursor_down_one_row(&clamped, None).0,
+        egui::Key::Home => galley.cursor_begin_of_row(&clamped),
+        egui::Key::End => galley.cursor_end_of_row(&clamped),
+        _ => clamped,
+    };
+    galley.clamp_cursor(&next).index.0
+}
+
+/// Delete rotated characters `[lo, hi)` (character indices); resets caret and selection.
+fn rotated_delete_chars(ed: &mut LineEditor, lo: usize, hi: usize) -> bool {
+    let len = ed.char_count();
+    let (lo, hi) = (lo.min(hi).min(len), lo.max(hi).min(len));
+    if lo == hi {
+        return false;
+    }
+    ed.text.drain(LineEditor::byte_at(&ed.text, lo)..LineEditor::byte_at(&ed.text, hi));
+    ed.cursor = lo;
+    ed.anchor = None;
+    ed.selection = None;
+    true
+}
+
+/// Delete behind the rotated caret: the selection, or one character (word with `word`).
+fn rotated_backspace(ed: &mut LineEditor, word: bool) -> bool {
+    ed.clamp_cursor();
+    if ed.anchor.is_some_and(|a| a != ed.cursor) {
+        let a = ed.anchor.unwrap_or(ed.cursor);
+        return rotated_delete_chars(ed, a, ed.cursor);
+    }
+    if ed.cursor == 0 {
+        return false;
+    }
+    let from = if word { word_start_before(&ed.text, ed.cursor) } else { ed.cursor.saturating_sub(1) };
+    rotated_delete_chars(ed, from, ed.cursor)
+}
+
+/// Delete ahead of the rotated caret: the selection, or one character (word with `word`).
+fn rotated_delete(ed: &mut LineEditor, word: bool) -> bool {
+    ed.clamp_cursor();
+    if ed.anchor.is_some_and(|a| a != ed.cursor) {
+        let a = ed.anchor.unwrap_or(ed.cursor);
+        return rotated_delete_chars(ed, a, ed.cursor);
+    }
+    let len = ed.char_count();
+    if ed.cursor >= len {
+        return false;
+    }
+    let to = if word { word_end_after(&ed.text, ed.cursor) } else { (ed.cursor + 1).min(len) };
+    rotated_delete_chars(ed, ed.cursor, to)
+}
+
+/// Inline editor turned to the paragraph's baseline. `egui::TextEdit` cannot rotate, so
+/// this lays the draft out with [`editor_job`], draws it through a rotated `TextShape`,
+/// and handles pointer and keys itself in galley space. Keyboard composition (IME)
+/// arrives only as committed text; wiring `Output::ime` is a follow-up.
+#[allow(clippy::too_many_arguments)]
+fn rotated_overlay(
+    ctx: &egui::Context,
+    ed: &mut LineEditor,
+    info: &DocInfo,
+    xf: &PageXform,
+    scale: f32,
+    background_ready: bool,
+    outside: bool,
+    hold: bool,
+) -> Option<bool> {
+    if hold {
+        ed.focus = true;
+    }
+    let fid = rotated_id();
+    if ed.focus || !ed.was_focused {
+        // (Re)claim until it sticks: the opening frame can run with input disabled
+        // (the opening click), which drops a one-shot request. Once held, losing it
+        // means commit, never a retry, so panels keep the focus they take.
+        if !ctx.memory(|m| m.has_focus(fid)) {
+            ctx.memory_mut(|m| m.request_focus(fid));
+        }
+        ed.focus = false;
+    }
+    let page_info = info.pages.get(ed.page)?;
+    let dir = Vec2::new(ed.angle.cos(), ed.angle.sin());
+    let up = Vec2::new(dir.y, -dir.x);
+    let to_screen = |x: f32, y: f32| {
+        let v = page_info.user_to_view(x, y);
+        xf.norm_to_screen(v[0] / xf.pw.max(1.0), v[1] / xf.ph.max(1.0))
+    };
+    let [x0, y0, x1, y1] = ed.source_rect;
+    let corners = [to_screen(x0, y0), to_screen(x0, y1), to_screen(x1, y0), to_screen(x1, y1)];
+    if corners.iter().any(|c| !c.is_finite()) {
+        // Degenerate geometry cannot host an editor; close it rather than wedge it open.
+        return Some(false);
+    }
+    // Reading start: least along the baseline, then highest. Correct for every angle,
+    // including upside-down text (the direction already points the other way).
+    let anchor = corners
+        .into_iter()
+        .min_by(|a, b| {
+            let ka = (a.x * dir.x + a.y * dir.y, -(a.x * up.x + a.y * up.y));
+            let kb = (b.x * dir.x + b.y * dir.y, -(b.x * up.x + b.y * up.y));
+            ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(Pos2::ZERO);
+    let text_color = color32(ed.look.color);
+    let mut done: Option<bool> = None;
+    egui::Area::new(egui::Id::new("edit-text-rotated")).order(egui::Order::Foreground).fixed_pos(Pos2::ZERO).show(ctx, |ui| {
+        // Single rows never wrap: they grow along the baseline the way the horizontal
+        // editor grows rightwards. Anything already broken wraps at the page edge along it.
+        let reach = [xf.rect.left_top(), xf.rect.right_top(), xf.rect.left_bottom(), xf.rect.right_bottom()]
+            .into_iter()
+            .map(|c| (c.x - anchor.x) * dir.x + (c.y - anchor.y) * dir.y)
+            .fold(0.0f32, f32::max);
+        let width = if !ed.text.contains('\n') && !ed.has_changes() { f32::INFINITY } else { (reach - 8.0).max(40.0) };
+        let mut job = editor_job(ui, ed, &ed.text, scale, width);
+        job.halign = egui::Align::LEFT;
+        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+        ed.clamp_cursor();
+        // Galley space → screen: the galley origin sits on the reading-start corner.
+        let to_s = |x: f32, y: f32| Pos2::new(anchor.x + dir.x * x - up.x * y, anchor.y + dir.y * x - up.y * y);
+        let to_local = |p: Pos2| {
+            let (dx, dy) = (p.x - anchor.x, p.y - anchor.y);
+            egui::vec2(dx * dir.x + dy * dir.y, -(dx * up.x + dy * up.y))
+        };
+        let frame = galley.rect.expand(2.0);
+        let quad = [
+            to_s(frame.left(), frame.top()),
+            to_s(frame.right(), frame.top()),
+            to_s(frame.right(), frame.bottom()),
+            to_s(frame.left(), frame.bottom()),
+        ];
+        let fill = if background_ready { Color32::TRANSPARENT } else { editor_fill(text_color) };
+        if fill != Color32::TRANSPARENT {
+            paint_quad(ui.painter(), quad, fill);
+        }
+        // Selection behind the glyphs, row by row like the horizontal editor.
+        if ed.anchor.is_some_and(|a| a != ed.cursor) {
+            use egui::text::CCursor;
+            let (lo, hi) = (ed.anchor.unwrap_or(ed.cursor).min(ed.cursor), ed.anchor.unwrap_or(ed.cursor).max(ed.cursor));
+            let min_l = galley.layout_from_cursor(CCursor::new(lo));
+            let max_l = galley.layout_from_cursor(CCursor::new(hi));
+            let bg = ui.visuals().selection.bg_fill;
+            for ri in min_l.row..=max_l.row {
+                let Some(placed) = galley.rows.get(ri) else { continue };
+                let row = &placed.row;
+                let left = if ri == min_l.row { row.x_offset(min_l.column) } else { 0.0 };
+                let right = if ri == max_l.row { row.x_offset(max_l.column) } else { row.size.x };
+                if right > left {
+                    let (lt, rb) = ((placed.pos.x + left, placed.pos.y), (placed.pos.x + right, placed.pos.y + row.size.y));
+                    paint_quad(ui.painter(), [to_s(lt.0, lt.1), to_s(rb.0, lt.1), to_s(rb.0, rb.1), to_s(lt.0, rb.1)], bg);
+                }
+            }
+        }
+        ui.painter().add(egui::epaint::TextShape::new(anchor, galley.clone(), text_color).with_angle(ed.angle));
+        ui.painter().add(egui::Shape::closed_line(quad.to_vec(), Stroke::new(1.5, ACCENT)));
+        // The pointer interaction owns the press so the page behind never sees it.
+        let bbox = Rect::from_min_max(
+            Pos2::new(quad.iter().map(|p| p.x).fold(f32::INFINITY, f32::min), quad.iter().map(|p| p.y).fold(f32::INFINITY, f32::min)),
+            Pos2::new(quad.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max), quad.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max)),
+        );
+        let resp = ui.interact(bbox.expand(4.0), fid, egui::Sense::click_and_drag());
+        // Memory focus, not `resp.has_focus`: that also needs the OS window focus,
+        // which headless runs (and background windows) never report.
+        let focused = ctx.memory(|m| m.has_focus(fid));
+        let precise = |p: Pos2| {
+            let pad = galley.rect.expand(6.0);
+            quad_contains(
+                [to_s(pad.left(), pad.top()), to_s(pad.right(), pad.top()), to_s(pad.right(), pad.bottom()), to_s(pad.left(), pad.bottom())],
+                p,
+            )
+        };
+        if resp.clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                if precise(p) {
+                    let idx = galley.cursor_from_pos(to_local(p)).index.0;
+                    if ui.input(|i| i.modifiers.shift) {
+                        if ed.anchor.is_none() {
+                            ed.anchor = Some(ed.cursor);
+                        }
+                        ed.cursor = idx;
+                    } else {
+                        ed.cursor = idx;
+                        ed.anchor = None;
+                    }
+                    ed.sync_selection();
+                } else {
+                    // The axis box corners are not text: treat them as clicking away.
+                    done = Some(true);
+                }
+            }
+        } else if resp.drag_started() && ed.anchor.is_none() {
+            ed.anchor = Some(ed.cursor);
+        }
+        if resp.dragged()
+            && let Some(p) = resp.interact_pointer_pos()
+        {
+            ed.cursor = galley.cursor_from_pos(to_local(p)).index.0;
+            ed.sync_selection();
+        }
+        if hover_precise(ui, precise) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+        }
+        // Caret, blinking while focused.
+        let caret = galley.pos_from_cursor(egui::text::CCursor::new(ed.cursor));
+        if focused && ctx.input(|i| i.time) % 1.0 < 0.6 {
+            let c = if background_ready { if luminance(text_color) < 0.5 { Color32::BLACK } else { Color32::WHITE } } else { caret_color_on(fill) };
+            ui.painter().line_segment([to_s(caret.center().x, caret.top()), to_s(caret.center().x, caret.bottom())], Stroke::new(2.0, c));
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        if focused {
+            let events = ui.input(|i| i.events.clone());
+            let mut changed = false;
+            for ev in &events {
+                if done.is_some() {
+                    break;
+                }
+                match ev {
+                    egui::Event::Text(t) => {
+                        if ui.input(|i| i.modifiers.command || i.modifiers.ctrl) {
+                            continue;
+                        }
+                        let insert = t.replace('\r', "");
+                        if insert.is_empty() {
+                            continue;
+                        }
+                        ed.replace_selection_with(&insert);
+                        changed = true;
+                    }
+                    egui::Event::Paste(s) => {
+                        ed.replace_selection_with(s);
+                        changed = true;
+                    }
+                    egui::Event::Key { key, pressed: true, modifiers: m, .. } => {
+                        let (shift, cmd) = (m.shift, m.command || m.ctrl);
+                        match key {
+                            egui::Key::ArrowLeft
+                            | egui::Key::ArrowRight
+                            | egui::Key::ArrowUp
+                            | egui::Key::ArrowDown
+                            | egui::Key::Home
+                            | egui::Key::End => {
+                                let next = rotated_move(
+                                    &galley,
+                                    ed.cursor,
+                                    *key,
+                                    cmd && matches!(key, egui::Key::ArrowLeft | egui::Key::ArrowRight),
+                                    &ed.text,
+                                );
+                                let next = if cmd && matches!(key, egui::Key::Home) {
+                                    0
+                                } else if cmd && matches!(key, egui::Key::End) {
+                                    ed.char_count()
+                                } else {
+                                    next
+                                };
+                                if shift && ed.anchor.is_none() {
+                                    ed.anchor = Some(ed.cursor);
+                                } else if !shift {
+                                    ed.anchor = None;
+                                }
+                                ed.cursor = next;
+                                ed.sync_selection();
+                            }
+                            egui::Key::Backspace => changed |= rotated_backspace(ed, cmd),
+                            egui::Key::Delete => changed |= rotated_delete(ed, cmd),
+                            egui::Key::Enter => {
+                                if cmd {
+                                    done = Some(true);
+                                } else {
+                                    ed.replace_selection_with("\n");
+                                    changed = true;
+                                }
+                            }
+                            egui::Key::Tab => done = Some(true),
+                            egui::Key::Escape => done = Some(false),
+                            egui::Key::A if cmd => {
+                                ed.anchor = Some(0);
+                                ed.cursor = ed.char_count();
+                                ed.sync_selection();
+                            }
+                            egui::Key::C if cmd => {
+                                if let Some(range) = ed.selection.clone() {
+                                    ctx.copy_text(ed.text.get(range.clone()).unwrap_or_default().to_owned());
+                                }
+                            }
+                            egui::Key::X if cmd => {
+                                if let Some(range) = ed.selection.clone() {
+                                    ctx.copy_text(ed.text.get(range.clone()).unwrap_or_default().to_owned());
+                                    let (lo, hi) = (range.start, range.end);
+                                    let to_chars = |b: usize| ed.text.char_indices().take_while(|(at, _)| *at < b).count();
+                                    let (lc, hc) = (to_chars(lo), to_chars(hi));
+                                    changed |= rotated_delete_chars(ed, lc, hc);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if changed {
+                ed.sync_selection();
+                ctx.request_repaint();
+            }
+        }
+        if ed.was_focused && !focused && !outside && !hold {
+            // Focus moved to another in-view widget: commit like the horizontal editor.
+            done = Some(true);
+        }
+        ed.was_focused = focused;
+        let (mut lo_a, mut hi_a, mut lo_u, mut hi_u) = (f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY);
+        for c in corners {
+            let (a, u) = (c.x * dir.x + c.y * dir.y, c.x * up.x + c.y * up.y);
+            lo_a = lo_a.min(a);
+            hi_a = hi_a.max(a);
+            lo_u = lo_u.min(u);
+            hi_u = hi_u.max(u);
+        }
+        ed.overflow = ed.has_changes() && (galley.rect.width() > hi_a - lo_a + 1.5 || galley.rect.height() > hi_u - lo_u + 1.5);
+    });
+    done
+}
+
+/// Whether the pointer hovers the precise rotated hit area (for the text cursor).
+fn hover_precise(ui: &egui::Ui, precise: impl Fn(Pos2) -> bool) -> bool {
+    ui.input(|i| i.pointer.hover_pos()).is_some_and(precise)
+}
+
 /// The inline editor; returns the edit once the text is applied.
 pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -> Option<Edit> {
     // Clicks outside the document (the Format text panel) keep the paragraph open.
@@ -965,8 +1483,20 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -
     }
     ed.rect = xf.user_rect(info, ed.page, ed.source_rect);
     ed.max_width = ed.rect.width();
-    let scale = (ed.rect.width() / (ed.source_rect[2] - ed.source_rect[0]).abs().max(0.01)).max(0.01);
+    // Screen pixels per view point: exact for every page and text rotation, unlike the
+    // box ratio (a displayed width over a user-space thickness on quarter turns).
+    let scale = page_scale(&xf, info, ed.page)?;
+    // Turning the view mid-edit re-aims the editor; only single rows rotate.
+    let user_rot = ed.source.as_ref().map(|(block, _)| block.rotation).unwrap_or(0.0);
+    let page_rot = info.pages.get(ed.page).map(|p| p.rotation).unwrap_or(0);
+    ed.angle = screen_angle(user_rot, page_rot, xf.rot);
+    ed.rotated = ed.angle.abs() > ROTATED_TOLERANCE && !ed.multiline;
+    ed.len_factor = baseline_factor(ed.source_rect, user_rot);
     ed.size = (ed.look.size as f32 * scale).clamp(1.0, 300.0);
+    if ed.rotated {
+        let done = rotated_overlay(ctx, ed, info, &xf, scale, background_ready, outside, hold);
+        return finish_edit(view, done);
+    }
     let font = editor_font(&ed.look, ed.size);
     let text_color = color32(ed.look.color);
     let mut done = None;
@@ -1044,6 +1574,11 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -
             });
         },
     );
+    finish_edit(view, done)
+}
+
+/// Turn the editor's closing verdict into the engine edit (shared by both overlays).
+fn finish_edit(view: &mut DocView, done: Option<bool>) -> Option<Edit> {
     match done {
         Some(apply) => {
             let ed = view.line_editor.take()?;
@@ -1093,6 +1628,12 @@ mod tests {
             overflow: false,
             max_width: 400.0,
             size: block.size as f32,
+            angle: 0.0,
+            rotated: false,
+            len_factor: 1.0,
+            cursor: block.text.chars().count(),
+            anchor: None,
+            was_focused: false,
             focus: true,
             look: look_of(&block),
             look0: look_of(&block),
@@ -1139,5 +1680,38 @@ mod tests {
         assert_eq!(caret_color_on(Color32::from_rgb(0xFF, 0xFF, 0xF4)), Color32::BLACK);
         assert_eq!(caret_color_on(Color32::BLACK), Color32::WHITE);
         assert_eq!(caret_color_on(DARK_EDITOR_FILL), Color32::WHITE);
+    }
+
+    #[test]
+    fn screen_angle_folds_user_page_and_view_turns() {
+        let deg = |a: f32| a.to_degrees();
+        assert!(deg(screen_angle(0.0, 0, 0)).abs() < 1e-4, "horizontal stays horizontal");
+        assert!((deg(screen_angle(25.0, 0, 0)) + 25.0).abs() < 1e-3, "user CCW shows up-right");
+        assert!((deg(screen_angle(0.0, 270, 0)) + 90.0).abs() < 1e-3, "a 270 page turns horizontal upright");
+        assert!((deg(screen_angle(0.0, 0, 90)) - 90.0).abs() < 1e-3, "a turned view turns it too");
+        assert!((screen_angle(0.0, 0, 180).abs() - std::f32::consts::PI).abs() < 1e-4, "upside down folds to PI");
+        assert_eq!(screen_angle(f64::NAN, 0, 0), 0.0, "garbage in never crashes the overlay");
+    }
+
+    #[test]
+    fn baseline_factor_measures_along_the_baseline() {
+        assert_eq!(baseline_factor([0.0, 0.0, 100.0, 10.0], 0.0), 1.0);
+        // A 65-degree user box 45 wide and 73 tall carries an ~85 baseline.
+        let f = baseline_factor([0.0, 0.0, 45.0, 73.0], 65.0);
+        assert!((f - 1.89).abs() < 0.02, "factor covers the full baseline: {f}");
+        assert_eq!(baseline_factor([0.0, 0.0, 0.0, 10.0], 65.0), 1.0, "degenerate boxes stay safe");
+        assert_eq!(baseline_factor([f32::NAN, 0.0, 1.0, 1.0], 65.0), 1.0);
+    }
+
+    #[test]
+    fn rotated_caret_moves_by_characters_and_words() {
+        assert_eq!(word_start_before("ab cd", 5), 3);
+        assert_eq!(word_start_before("ab cd", 3), 0);
+        assert_eq!(word_start_before("ab cd", 0), 0);
+        assert_eq!(word_end_after("ab cd", 0), 3);
+        assert_eq!(word_end_after("ab cd", 3), 5);
+        // Byte math stays on Cyrillic boundaries (two bytes per letter).
+        assert_eq!(LineEditor::byte_at("Точка", 3), 6);
+        assert_eq!(LineEditor::byte_at("Точка", 99), 10);
     }
 }
